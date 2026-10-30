@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+  external_labels:
+    env: production
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: benchu-canvas-api
+    metrics_path: /api/metrics
+    # The API is internal-only; scrape over the cluster network.
+    static_configs:
+      - targets: ['api:4000']
+    # Uncomment when METRICS_TOKEN is set.
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/metrics-token
+
+  # Workers have no HTTP surface — their health is visible through
+  # benchu_tasks_total and benchu_queue_depth exported by the API.

@@ -1,0 +1,328 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    name: Server (typecheck · unit · build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: node scripts/check-encoding.mjs
+      - run: npm test
+      - run: npm run build
+
+  web:
+    name: Web (lint · format · typecheck · build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npx tsc --noEmit -p tsconfig.app.json
+      - run: npm run build
+
+  web-e2e:
+    name: Web browser E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+
+  deploy-artifacts:
+    name: Single-machine Compose acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      # Validate both artifact contents and the complete deployed topology.
+      - name: Validate single-machine Compose
+        run: |
+          docker compose config --quiet
+          npm run test:deploy
+          npm run deploy:preflight -- --env-file deploy/fixtures/preflight-test.env.txt
+          bash -n deploy/backup-single.sh
+          bash -n deploy/restore-single.sh
+          node --check scripts/smoke-single.mjs
+          npx playwright test --config=playwright.compose.config.ts --list
+
+      - name: Build deployable images
+        run: docker compose build api web
+
+      - name: Verify API runtime contents
+        run: |
+          docker run --rm --entrypoint sh benchu-canvas-api:local -c '
+            test "$(id -u)" = 1000 &&
+            test -w /app/storage &&
+            ffmpeg -version >/dev/null &&
+            test -f dist/db/migrations/0001_baseline.sql &&
+            test -f dist/db/migrations/0005_oidc_identities.sql &&
+            test -f dist/db/migrations/0006_asset_upload_idempotency.sql &&
+            test -f dist/db/migrations/0007_canvas_documents.sql &&
+            test -f dist/db/migrations/0016_task_next_attempt_at.sql &&
+            test "$(find dist/db/migrations -name '*.sql' | wc -l | tr -d ' ')" = 16 &&
+            test -f dist/scripts/storage-lifecycle.js &&
+            node --check dist/bootstrap-api.js
+          '
+
+      - name: Verify nginx runtime configuration
+        run: |
+          docker compose run --rm --no-deps --entrypoint nginx web -t
+          rendered="$(docker compose run --rm --no-deps --entrypoint nginx web -T 2>&1)"
+          printf '%s' "$rendered" | grep -F 'log_format safe'
+          printf '%s' "$rendered" | grep -F 'proxy_request_buffering off'
+          printf '%s' "$rendered" | grep -F 'Content-Security-Policy'
+
+      - name: Seed a legacy root-owned storage volume
+        run: |
+          docker compose run --rm --no-deps --entrypoint sh storage-init -c \
+            'mkdir -p /data/legacy && touch /data/legacy/root-file && chown -R 0:0 /data'
+
+      - name: Start the complete single-machine stack
+        run: docker compose up -d --no-build
+
+      - name: Verify non-root API can write the migrated volume
+        run: |
+          docker compose exec -T api sh -c '
+            test "$(id -u)" = 1000 &&
+            test -w /app/storage/legacy &&
+            printf ok > /app/storage/legacy/probe &&
+            rm /app/storage/legacy/probe
+          '
+
+      - name: Run deployed-stack acceptance
+        run: |
+          node scripts/smoke-single.mjs
+          npm run test:e2e:compose
+          docker compose stop api
+          curl --max-time 10 -fsS 'http://127.0.0.1:8080/media/missing?token=LEAK_MARKER&s=LEAK_MARKER' >/dev/null || true
+          leaked=0
+          if docker compose logs --no-color web | grep -F 'LEAK_MARKER'; then leaked=1; fi
+          docker compose start api
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/api/ready >/dev/null; then break; fi
+            if [ "$i" -eq 60 ]; then exit 1; fi
+            sleep 2
+          done
+          if [ "$leaked" -ne 0 ]; then
+            echo 'nginx logs leaked a query-string credential marker' >&2
+            exit 1
+          fi
+          sentinel_value="restore-sentinel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run --rm --volume benchu-canvas_app-storage:/data alpine:3.20 \
+            sh -c 'mkdir -p /data/ci && printf %s "$1" > /data/ci/restore-sentinel.txt' sh "$sentinel_value"
+          sentinel_sha="$(printf %s "$sentinel_value" | sha256sum | cut -d ' ' -f 1)"
+          BACKUP_ROOT="$RUNNER_TEMP/benchu-backups" bash deploy/backup-single.sh
+          backup_dir="$(find "$RUNNER_TEMP/benchu-backups" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          test -n "$backup_dir"
+          (cd "$backup_dir" && sha256sum --check SHA256SUMS)
+          docker compose exec -T api node dist/scripts/storage-lifecycle.js --json
+          before_users="$(docker compose exec -T mysql sh -c 'mysql -N -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "SELECT COUNT(*) FROM users"' | tr -d '\r')"
+          docker compose down -v --remove-orphans
+          bash deploy/restore-single.sh "$backup_dir"
+          restored_sha="$(docker run --rm --volume benchu-canvas_app-storage:/data:ro alpine:3.20 \
+            sha256sum /data/ci/restore-sentinel.txt | cut -d ' ' -f 1)"
+          test "$sentinel_sha" = "$restored_sha"
+          docker compose up -d --no-build
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8080/api/ready >/dev/null; then break; fi
+            if [ "$i" -eq 90 ]; then exit 1; fi
+            sleep 2
+          done
+          after_users="$(docker compose exec -T mysql sh -c 'mysql -N -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "SELECT COUNT(*) FROM users"' | tr -d '\r')"
+          test "$before_users" = "$after_users"
+          node scripts/smoke-single.mjs
+
+      - name: Upload deployed-stack Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+
+      - name: Show Compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Stop acceptance stack
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  e2e:
+    name: E2E (MySQL + Redis + API)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: benchu_canvas
+          MYSQL_USER: benchu
+          MYSQL_PASSWORD: benchu_dev_pw
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -prootpw"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: benchu-test
+        ports: ['9000:9000']
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: '3306'
+      DB_USER: benchu
+      DB_PASSWORD: benchu_dev_pw
+      DB_NAME: benchu_canvas
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: '6379'
+      JWT_SECRET: ci-secret
+      STORAGE_SIGN_SECRET: ci-secret
+      PAYMENT_PROVIDER: mock
+      PAYMENT_WEBHOOK_SECRET: ci-webhook-secret
+      PUBLIC_BASE_URL: http://127.0.0.1:4000
+      FFMPEG_PATH: ffmpeg
+      HOST: 127.0.0.1
+      PORT: '4000'
+      CORS_ORIGIN: http://127.0.0.1:5183
+      SEED_EMAIL: demo@benchu.art
+      SEED_PASSWORD: demo1234
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: npm ci
+      - run: npm run db:init
+
+      # Start the API as a background job, wait for readiness, then run E2E.
+      - name: Start API & worker
+        run: |
+          npm run build > /dev/null
+          node dist/bootstrap-api.js > api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4000/api/health > /dev/null; then
+              echo "API ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to become ready"
+          cat api.log
+          exit 1
+        shell: bash
+      - run: npm run e2e
+
+      # This is deliberately run against the real API rather than the mocked
+      # public browser suite: it proves the UI can register, create a task,
+      # receive the rendered MP4, and remove the record.
+      - name: Browser real generation journey
+        working-directory: .
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:e2e -- e2e/real-generation.spec.ts
+        env:
+          RUN_REAL_E2E: 'true'
+
+      - name: Reaper chaos drill (worker dies mid-task)
+        run: npm run drill:reaper
+
+      - name: Billing drill (orders, webhooks, quotas)
+        run: npm run drill:billing
+
+      - name: Migration drill (throwaway databases)
+        run: npm run drill:migrations
+        env:
+          DRILL_DB_USER: root
+          DRILL_DB_PASSWORD: rootpw
+
+      - name: S3 driver drill (real MinIO)
+        run: |
+          # The service container creates the bucket; give it a moment.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live > /dev/null; then break; fi
+            sleep 1
+          done
+          npm run drill:s3
+        env:
+          S3_ENDPOINT: http://127.0.0.1:9000
+          S3_BUCKET: benchu-test
+          S3_ACCESS_KEY_ID: minioadmin
+          S3_SECRET_ACCESS_KEY: minioadmin
+        shell: bash
+
+      - name: Show API log on failure
+        if: failure()
+        run: cat api.log
+        shell: bash

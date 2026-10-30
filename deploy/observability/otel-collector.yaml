@@ -1,0 +1,33 @@
+# Receives OTLP/HTTP protobuf and forwards traces to Tempo.
+# The API exporter url is http://otel-collector:4318/v1/traces.
+# This exporter's endpoint is the base URL; the collector appends /v1/traces itself.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 64
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  otlphttp:
+    endpoint: http://tempo:4318
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp]

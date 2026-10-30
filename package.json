@@ -1,0 +1,64 @@
+{
+  "name": "benchu-canvas",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"e2e/**/*.ts\" \"deploy/**/*.mjs\" \"public/**/*.js\" index.html \"playwright*.config.ts\" eslint.config.js package.json",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"e2e/**/*.ts\" \"deploy/**/*.mjs\" \"public/**/*.js\" index.html \"playwright*.config.ts\" eslint.config.js package.json",
+    "test:e2e": "playwright test",
+    "test:e2e:compose": "playwright test --config=playwright.compose.config.ts",
+    "test:e2e:ui": "playwright test --ui",
+    "server:install": "npm --prefix server install",
+    "server:init": "npm --prefix server run db:init",
+    "server:dev": "npm --prefix server run dev",
+    "db:start": "node scripts/db-start.mjs",
+    "dev:all": "node scripts/dev-all.mjs",
+    "deploy:up": "npm run deploy:preflight && docker compose up -d --build",
+    "deploy:down": "docker compose down",
+    "deploy:logs": "docker compose logs -f api web",
+    "deploy:preflight": "node deploy/preflight-single.mjs",
+    "deploy:smoke": "node scripts/smoke-single.mjs",
+    "deploy:backup": "bash deploy/backup-single.sh",
+    "deploy:restore": "bash deploy/restore-single.sh",
+    "deploy:cleanup": "docker compose exec -T api node dist/scripts/storage-lifecycle.js",
+    "test:deploy": "node --test deploy/preflight-single.test.mjs"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md,css,yml,yaml}": "prettier --write"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.104.5",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.548.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.4",
+    "react-virtuoso": "^4.18.19"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.64.1",
+    "@tailwindcss/vite": "^4.1.16",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.1",
+    "@vitejs/plugin-react": "^5.0.4",
+    "eslint": "^10.13.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.10",
+    "tailwindcss": "^4.1.16",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.0",
+    "vite": "^7.1.14"
+  }
+}

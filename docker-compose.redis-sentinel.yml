@@ -1,0 +1,102 @@
+name: benchu-canvas
+
+# Optional single-machine Redis replica and Sentinel. Not part of the default project.
+# Start it only together with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.redis-sentinel.yml up -d
+# `docker compose up` alone does not create these containers, and the API keeps REDIS_HOST=redis.
+# Sentinel monitors the master named redis. Application code keeps using REDIS_HOST only.
+
+x-logging: &sentinel-logging
+  driver: json-file
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-20m}
+    max-file: ${CONTAINER_LOG_MAX_FILES:-5}
+    compress: "true"
+
+services:
+  redis:
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-384mb}
+      - --maxmemory-policy
+      - noeviction
+      - --replica-announce-ip
+      - redis
+      - --replica-announce-port
+      - "6379"
+
+  redis-replica:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *sentinel-logging
+    cpus: ${REDIS_REPLICA_CPU_LIMIT:-0.5}
+    mem_limit: ${REDIS_REPLICA_MEMORY_LIMIT:-512m}
+    pids_limit: ${REDIS_REPLICA_PIDS_LIMIT:-128}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - ${REDIS_REPLICA_MAXMEMORY:-384mb}
+      - --maxmemory-policy
+      - noeviction
+      - --replicaof
+      - redis
+      - "6379"
+      - --replica-read-only
+      - "yes"
+      - --replica-priority
+      - "0"
+      - --replica-announce-ip
+      - redis-replica
+      - --replica-announce-port
+      - "6379"
+    ports:
+      - "127.0.0.1:${REDIS_REPLICA_FORWARD_PORT:-6380}:6379"
+    volumes:
+      - redis-replica-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli --raw ROLE | tr '\\n' ' ' | grep -q '^slave redis 6379 connected ' && redis-cli --raw CONFIG GET replica-read-only | tr '\\n' ' ' | grep -q 'replica-read-only yes'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  redis-sentinel:
+    image: redis:7-alpine
+    user: redis
+    restart: unless-stopped
+    logging: *sentinel-logging
+    cpus: ${REDIS_SENTINEL_CPU_LIMIT:-0.25}
+    mem_limit: ${REDIS_SENTINEL_MEMORY_LIMIT:-128m}
+    pids_limit: ${REDIS_SENTINEL_PIDS_LIMIT:-64}
+    entrypoint: ["/bin/sh", "/usr/local/bin/redis-sentinel-entrypoint.sh"]
+    command: []
+    volumes:
+      - ./deploy/redis/sentinel-entrypoint.sh:/usr/local/bin/redis-sentinel-entrypoint.sh:ro
+    ports:
+      - "127.0.0.1:${REDIS_SENTINEL_FORWARD_PORT:-26379}:26379"
+    depends_on:
+      redis:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/sh", "/usr/local/bin/redis-sentinel-entrypoint.sh", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
+
+volumes:
+  redis-replica-data:

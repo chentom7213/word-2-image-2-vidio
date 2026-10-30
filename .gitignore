@@ -1,0 +1,36 @@
+node_modules
+dist
+dist-ssr
+*.local
+.vite
+_reference
+page*.png
+*.tsbuildinfo
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+server/.env
+server/.env.*
+!server/.env.example
+# k8s secret manifests with real values
+deploy/k8s/**/secret-*.yaml
+
+# runtime data
+server/uploads
+server/storage
+server/dist
+server/.render-smoke
+.mysql-data
+D:\mysql-dev-data
+*.log
+test-results/
+playwright-report/
+blob-report/
+backups/
+
+# ad-hoc request payloads used during manual curl testing
+server/exec_*.json
+server/exec_*.txt
+server/*.err

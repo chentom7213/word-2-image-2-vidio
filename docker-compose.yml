@@ -1,0 +1,184 @@
+name: benchu-canvas
+
+# Single-machine test topology: web + API/embedded worker + MySQL + Redis.
+x-api-environment: &api-environment
+  NODE_ENV: ${NODE_ENV:-development}
+  PORT: 4000
+  HOST: 0.0.0.0
+  DB_HOST: mysql
+  DB_PORT: 3306
+  DB_USER: ${DB_USER:-benchu}
+  DB_PASSWORD: ${DB_PASSWORD:-benchu_dev_pw}
+  DB_NAME: ${DB_NAME:-benchu_canvas}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  QUEUE_ENABLED: "true"
+  RBAC_MEMBERSHIP_CACHE_TTL_SECONDS: ${RBAC_MEMBERSHIP_CACHE_TTL_SECONDS:-300}
+  EMBEDDED_WORKER: "true"
+  WORKER_NAME: single-machine
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+  FFMPEG_THREADS: ${FFMPEG_THREADS:-2}
+  STORAGE_DRIVER: local
+  OUTPUT_DIR: /app/storage
+  JWT_SECRET: ${JWT_SECRET:-local-test-jwt-secret-change-before-production}
+  STORAGE_SIGN_SECRET: ${STORAGE_SIGN_SECRET:-local-test-storage-secret-change-before-production}
+  PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-mock}
+  PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-local-test-payment-secret}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+  CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+  REFRESH_COOKIE_SECURE: ${REFRESH_COOKIE_SECURE:-false}
+  SEED_EMAIL: ${SEED_EMAIL:-demo@benchu.art}
+  SEED_PASSWORD: ${SEED_PASSWORD:-demo1234}
+  LOG_JSON: ${LOG_JSON:-true}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  MODERATION_OUTPUT_URL: ${MODERATION_OUTPUT_URL:-}
+  MODERATION_OUTPUT_TOKEN: ${MODERATION_OUTPUT_TOKEN:-}
+  OTEL_ENABLED: ${OTEL_ENABLED:-false}
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-20m}
+    max-file: ${CONTAINER_LOG_MAX_FILES:-5}
+    compress: "true"
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    logging: *default-logging
+    cpus: ${MYSQL_CPU_LIMIT:-1.5}
+    mem_limit: ${MYSQL_MEMORY_LIMIT:-1536m}
+    pids_limit: ${MYSQL_PIDS_LIMIT:-256}
+    shm_size: ${MYSQL_SHM_SIZE:-256m}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_DATABASE: ${DB_NAME:-benchu_canvas}
+      MYSQL_USER: ${DB_USER:-benchu}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-benchu_dev_pw}
+    ports:
+      - "127.0.0.1:${DB_FORWARD_PORT:-3307}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    cpus: ${REDIS_CPU_LIMIT:-0.5}
+    mem_limit: ${REDIS_MEMORY_LIMIT:-512m}
+    pids_limit: ${REDIS_PIDS_LIMIT:-128}
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory",
+        "${REDIS_MAXMEMORY:-384mb}",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
+    ports:
+      - "127.0.0.1:${REDIS_FORWARD_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  storage-init:
+    image: alpine:3.20
+    restart: "no"
+    logging: *default-logging
+    read_only: true
+    cpus: ${STORAGE_INIT_CPU_LIMIT:-0.25}
+    mem_limit: ${STORAGE_INIT_MEMORY_LIMIT:-256m}
+    pids_limit: ${STORAGE_INIT_PIDS_LIMIT:-64}
+    command: ["sh", "-c", "chown -R 1000:1000 /data"]
+    volumes:
+      - app-storage:/data
+
+  migrate:
+    image: benchu-canvas-api:local
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    environment: *api-environment
+    command: ["node", "dist/db/init.js"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "on-failure:3"
+    logging: *default-logging
+    cpus: ${MIGRATE_CPU_LIMIT:-0.5}
+    mem_limit: ${MIGRATE_MEMORY_LIMIT:-512m}
+    pids_limit: ${MIGRATE_PIDS_LIMIT:-128}
+
+  api:
+    image: benchu-canvas-api:local
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: ${API_STOP_GRACE_PERIOD:-5m}
+    cpus: ${API_CPU_LIMIT:-2.5}
+    mem_limit: ${API_MEMORY_LIMIT:-3g}
+    pids_limit: ${API_PIDS_LIMIT:-512}
+    init: true
+    environment: *api-environment
+    ports:
+      - "127.0.0.1:${API_FORWARD_PORT:-4000}:4000"
+    volumes:
+      - app-storage:/app/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    logging: *default-logging
+    cpus: ${WEB_CPU_LIMIT:-0.25}
+    mem_limit: ${WEB_MEMORY_LIMIT:-128m}
+    pids_limit: ${WEB_PIDS_LIMIT:-128}
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql-data:
+  redis-data:
+  app-storage:

@@ -1,0 +1,70 @@
+name: benchu-canvas
+
+# Optional single-machine read replica. It is not part of the default project.
+# Start it only together with the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.mysql-replica.yml up -d
+# `docker compose up` alone does not create this container, and the API keeps DB_HOST=mysql.
+
+x-logging: &replica-logging
+  driver: json-file
+  options:
+    max-size: ${CONTAINER_LOG_MAX_SIZE:-20m}
+    max-file: ${CONTAINER_LOG_MAX_FILES:-5}
+    compress: "true"
+
+services:
+  mysql:
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --server-id=1
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+
+  mysql-replica:
+    image: mysql:8.4
+    restart: unless-stopped
+    logging: *replica-logging
+    cpus: ${MYSQL_REPLICA_CPU_LIMIT:-1}
+    mem_limit: ${MYSQL_REPLICA_MEMORY_LIMIT:-1536m}
+    pids_limit: ${MYSQL_REPLICA_PIDS_LIMIT:-256}
+    shm_size: ${MYSQL_REPLICA_SHM_SIZE:-256m}
+    entrypoint: ["/bin/bash", "/usr/local/bin/mysql-replica-entrypoint.sh"]
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --server-id=2
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --relay-log=relay-bin
+      - --read-only=ON
+      - --super-read-only=ON
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpw}
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+      MYSQL_REPLICATION_USER: ${MYSQL_REPLICATION_USER:-repl}
+      MYSQL_REPLICATION_PASSWORD: ${MYSQL_REPLICATION_PASSWORD:-repl_dev_pw}
+      REPLICA_SOURCE_DATABASE: ${DB_NAME:-benchu_canvas}
+    ports:
+      - "127.0.0.1:${DB_REPLICA_FORWARD_PORT:-3308}:3306"
+    volumes:
+      - mysql-replica-data:/var/lib/mysql
+      - ./deploy/mysql/replica-entrypoint.sh:/usr/local/bin/mysql-replica-entrypoint.sh:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "set -o pipefail; mysql --protocol=tcp -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} -N -B -e \"SELECT 1 WHERE @@global.read_only=1 AND @@global.super_read_only=1 AND (SELECT COUNT(*) FROM performance_schema.replication_connection_status WHERE SERVICE_STATE='ON')>=1 AND (SELECT COUNT(*) FROM performance_schema.replication_applier_status WHERE SERVICE_STATE='ON')>=1 AND (SELECT COUNT(*) FROM performance_schema.replication_connection_configuration WHERE HOST='mysql')>=1\" | grep -q 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+volumes:
+  mysql-replica-data:

@@ -1,0 +1,128 @@
+groups:
+  - name: benchu-canvas.golden-signals
+    interval: 30s
+    rules:
+      # ── P0：钱 ────────────────────────────────────────────────────────
+      # 唯一必须恒为 0 的指标：余额漂移 + 重复扣费 + 漏退款。
+      - alert: BillingReconciliationDrift
+        expr: benchu_reconcile_issues > 0
+        for: 1m
+        labels:
+          severity: critical
+          area: billing
+        annotations:
+          summary: '账务对账失败：余额与流水不一致'
+          description: '存在 {{ $value }} 项账务异常（余额漂移 / 重复扣费 / 漏退款）。'
+          runbook: 'GET /api/admin/reconcile 查看明细；修复方式永远是补记流水，不可直接改 users.credits'
+
+      # ── P1：可用性 ────────────────────────────────────────────────────
+      - alert: TaskSuccessRateLow
+        expr: |
+          (
+            sum(rate(benchu_tasks_total{outcome="ok"}[5m]))
+            /
+            clamp_min(sum(rate(benchu_tasks_total[5m])), 0.001)
+          ) < 0.95
+        for: 5m
+        labels:
+          severity: warning
+          area: pipeline
+        annotations:
+          summary: '任务成功率低于 95%'
+          description: '当前成功率 {{ $value | humanizePercentage }}（阈值 95%，持续 5 分钟）。排查 Provider 错误与死锁。'
+
+      - alert: QueueBacklogGrowing
+        expr: benchu_queue_depth > 500
+        for: 10m
+        labels:
+          severity: warning
+          area: pipeline
+        annotations:
+          summary: '队列积压超过 500 且持续 10 分钟'
+          description: '当前积压 {{ $value }}。检查 worker 副本数与渲染耗时；扩 worker 而不是扩 API。'
+
+      - alert: Http5xxRateHigh
+        expr: |
+          sum(rate(benchu_http_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(benchu_http_requests_total[5m])), 0.001)
+          > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          area: api
+        annotations:
+          summary: 'API 5xx 比例超过 1%'
+          description: '5xx 占比 {{ $value | humanizePercentage }}。用 traceId 去日志里定位。'
+
+      - alert: StaleRunningTasks
+        expr: benchu_tasks_running_stale > 20
+        for: 10m
+        labels:
+          severity: warning
+          area: pipeline
+        annotations:
+          summary: '僵尸任务超过 20 个'
+          description: 'running 状态长时间无心跳。检查 reaper 是否在跑、worker 是否被 OOM kill。'
+
+      - alert: ProviderErrorRateHigh
+        expr: |
+          sum(rate(benchu_tasks_total{outcome="fail"}[5m])) by (model)
+          /
+          clamp_min(sum(rate(benchu_tasks_total[5m])) by (model), 0.001)
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          area: provider
+        annotations:
+          summary: '模型 {{ $labels.model }} 错误率超过 10%'
+          description: '考虑熔断该模型并切换到备用 Provider。'
+
+      - alert: ProviderCredentialRejected
+        expr: increase(benchu_provider_auth_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          area: provider
+        annotations:
+          summary: '上游凭证被拒绝'
+          description: '最近 5 分钟出现 PROVIDER_AUTH。用户侧已经退款。'
+          runbook: '检查对应模型的 Provider 密钥是否过期或被撤。不要用同一把失效密钥继续重试。'
+
+      - alert: TaskRetriesExhausted
+        expr: increase(benchu_tasks_dead_letter_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          area: provider
+        annotations:
+          summary: '有任务用尽重试'
+          description: '可重试错误把尝试次数用完后计入死信。失败行仍留在 generation_tasks，用户已退款。'
+          runbook: '按模型查看 benchu_tasks_dead_letter_total。先确认上游是否持续 5xx。不要从 generation_tasks 删掉失败行。'
+
+      # ── P2：性能 ──────────────────────────────────────────────────────
+      - alert: ApiLatencyP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(benchu_http_request_duration_ms_bucket{route!~"/api/generations/.*/stream"}[5m]))
+          ) > 800
+        for: 10m
+        labels:
+          severity: info
+          area: api
+        annotations:
+          summary: 'API P95 延迟超过 800ms'
+          description: '当前 P95 {{ $value }}ms（已排除 SSE 长连接）。先看 DB 慢查询，再考虑缓存。'
+
+      # ── 进程自监控 ────────────────────────────────────────────────────
+      - alert: MetricsEndpointDown
+        expr: up{job="benchu-canvas-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          area: api
+        annotations:
+          summary: 'API 实例不可达'
+          description: 'Prometheus 抓取 {{ $labels.instance }} 失败超过 2 分钟。检查 /api/ready 与容器状态。'

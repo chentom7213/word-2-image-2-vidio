@@ -1,0 +1,138 @@
+# 灰度 API 与灰度 Ingress。不要把 canary 注解写进 deploy/k8s/api.yaml 的 benchu Ingress。
+# 稳定版 Ingress 继续把全部普通流量送到 Service api。本文件默认不按百分比分流。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchu-api-canary
+  namespace: benchu
+  labels:
+    app.kubernetes.io/name: benchu-api-canary
+spec:
+  # 默认 1 个副本。放量前不需要把它扩成稳定版的规模。
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: benchu-api-canary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: benchu-api-canary
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: api
+          # 灰度发布时只替换这个镜像标签。权重仍保持 0，先用请求头或 Cookie 验证。
+          image: registry.example.com/benchu/canvas-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 4000
+          # 非秘密环境与稳定版相同，引用已有 ConfigMap / Secret，本文件不写入密钥。
+          envFrom:
+            - configMapRef:
+                name: benchu-api-config
+            - secretRef:
+                name: benchu-secrets
+          env:
+            # ConfigMap 里已经是 false。这里再固定一次，灰度 API 不消费队列。
+            - name: EMBEDDED_WORKER
+              value: 'false'
+          livenessProbe:
+            httpGet: { path: /api/live, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /api/ready, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet: { path: /api/live, port: http }
+            failureThreshold: 30
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: '1'
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ['ALL']
+          volumeMounts:
+            - name: artifacts
+              mountPath: /data
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: benchu-artifacts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-canary
+  namespace: benchu
+spec:
+  selector:
+    app.kubernetes.io/name: benchu-api-canary
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: benchu-canary
+  namespace: benchu
+  annotations:
+    # 权重 0：默认没有百分比流量。普通请求仍全部进入稳定版 Ingress（benchu → api）。
+    # 只有请求头 X-Canary: always，或 Cookie benchu_canary=always，才会进入灰度后端 api-canary。
+    # 默认不要改 canary-weight。确认灰度版本健康后，再按顺序把权重改成 "5"、"25"、"100"。
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "0"
+    nginx.ingress.kubernetes.io/canary-by-header: X-Canary
+    nginx.ingress.kubernetes.io/canary-by-cookie: benchu_canary
+    # 与稳定版 Ingress 对齐，避免灰度路径上的上传和 SSE 使用另一套代理限制。
+    nginx.ingress.kubernetes.io/ssl-protocols: 'TLSv1.2 TLSv1.3'
+    nginx.ingress.kubernetes.io/proxy-body-size: '60m'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '900'
+    nginx.ingress.kubernetes.io/proxy-buffering: 'off'
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ['app.example.com']
+      secretName: benchu-tls
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-canary
+                port:
+                  number: 4000
+          - path: /media
+            pathType: Prefix
+            backend:
+              service:
+                name: api-canary
+                port:
+                  number: 4000

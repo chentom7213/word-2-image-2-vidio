@@ -1,0 +1,11 @@
+node_modules
+dist
+storage
+uploads
+.render-smoke
+coverage
+*.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
